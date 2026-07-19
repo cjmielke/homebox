@@ -57,7 +57,7 @@
 
 <script setup lang="ts">
   import { computed, ref, watch } from "vue";
-  import { BarcodeFormat, BrowserMultiFormatReader, NotFoundException } from "@zxing/library";
+  import { BarcodeFormat, BrowserMultiFormatReader, Exception, NotFoundException, Result } from "@zxing/library";
   import { useI18n } from "vue-i18n";
   import { DialogID } from "@/components/ui/dialog-provider/utils";
   import { Dialog, DialogHeader, DialogScrollContent, DialogTitle } from "@/components/ui/dialog";
@@ -82,6 +82,18 @@
   const detectedBarcodeType = ref<string>("");
 
   const LAST_USED_DEVICE_ID_KEY = "homebox:lastUsedDeviceId";
+
+  // Some mobile browsers (Android Chrome/Firefox) fail to reacquire a camera
+  // immediately after a previous getUserMedia stream was stopped, because the
+  // OS-level hardware release isn't synchronous with track.stop() resolving.
+  // This surfaces as a DOMException ("Starting videoinput failed" /
+  // NotReadableError) on the very next getUserMedia call (#1290). Toggling
+  // between cameras a few times works around it by giving the hardware more
+  // time to release; these constants automate the same wait-and-retry.
+  const CAMERA_START_RETRY_ATTEMPTS = 3;
+  const CAMERA_START_RETRY_DELAY_MS = 400;
+
+  const sleep = (ms: number) => new Promise<void>(resolve => setTimeout(resolve, ms));
 
   const handleError = (error: unknown) => {
     console.error("Scanner error:", error);
@@ -171,46 +183,64 @@
       console.warn("failed to persist selected camera", e);
     }
 
-    try {
-      await codeReader.decodeFromVideoDevice(newSource, video.value!, (result, err) => {
-        if (result && !loading.value) {
-          loading.value = true;
-          try {
-            const url = new URL(result.getText());
-            if (!url.pathname.startsWith("/")) {
-              throw new Error(t("scanner.invalid_url"));
-            }
-            const sanitizedPath = url.pathname.replace(/[^a-zA-Z0-9-_/]/g, "");
-            closeDialog(DialogID.Scanner);
-            navigateTo(sanitizedPath);
-          } catch (err) {
-            // Check if it's a barcode for a new element
-            const bcfmt = result.getBarcodeFormat();
-
-            switch (bcfmt) {
-              case BarcodeFormat.EAN_13:
-              case BarcodeFormat.UPC_A:
-              case BarcodeFormat.UPC_E:
-              case BarcodeFormat.UPC_EAN_EXTENSION:
-                console.info("Barcode detected");
-                detectedBarcode.value = result.getText();
-                detectedBarcodeType.value = BarcodeFormat[bcfmt].replaceAll("_", "-");
-                break;
-
-              default:
-                handleError(err);
-            }
-
-            loading.value = false;
+    const decodeCallback = (result: Result, err?: Exception) => {
+      if (result && !loading.value) {
+        loading.value = true;
+        try {
+          const url = new URL(result.getText());
+          if (!url.pathname.startsWith("/")) {
+            throw new Error(t("scanner.invalid_url"));
           }
+          const sanitizedPath = url.pathname.replace(/[^a-zA-Z0-9-_/]/g, "");
+          closeDialog(DialogID.Scanner);
+          navigateTo(sanitizedPath);
+        } catch (err) {
+          // Check if it's a barcode for a new element
+          const bcfmt = result.getBarcodeFormat();
+
+          switch (bcfmt) {
+            case BarcodeFormat.EAN_13:
+            case BarcodeFormat.UPC_A:
+            case BarcodeFormat.UPC_E:
+            case BarcodeFormat.UPC_EAN_EXTENSION:
+              console.info("Barcode detected");
+              detectedBarcode.value = result.getText();
+              detectedBarcodeType.value = BarcodeFormat[bcfmt].replaceAll("_", "-");
+              break;
+
+            default:
+              handleError(err);
+          }
+
+          loading.value = false;
         }
-        if (err && !(err instanceof NotFoundException)) {
-          console.error(err);
+      }
+      if (err && !(err instanceof NotFoundException)) {
+        console.error(err);
+        handleError(err);
+      }
+    };
+
+    for (let attempt = 1; attempt <= CAMERA_START_RETRY_ATTEMPTS; attempt++) {
+      try {
+        if (attempt > 1) {
+          codeReader.reset();
+        }
+        await codeReader.decodeFromVideoDevice(newSource, video.value!, decodeCallback);
+        return;
+      } catch (err) {
+        const isRetryableStreamStartFailure = err instanceof DOMException && err.name !== "NotAllowedError";
+        const isLastAttempt = attempt === CAMERA_START_RETRY_ATTEMPTS;
+        if (!isRetryableStreamStartFailure || isLastAttempt) {
           handleError(err);
+          return;
         }
-      });
-    } catch (err) {
-      handleError(err);
+        await sleep(CAMERA_START_RETRY_DELAY_MS);
+        if (!open.value || selectedSource.value !== newSource) {
+          // Dialog closed or camera changed while waiting to retry.
+          return;
+        }
+      }
     }
   });
 
